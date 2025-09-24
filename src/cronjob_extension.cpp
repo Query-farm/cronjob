@@ -6,10 +6,12 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "ccronexpr.h"
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -23,6 +25,7 @@ struct CronTask {
     std::vector<std::pair<std::chrono::system_clock::time_point, string>> execution_history;
     std::mutex mutex;
     cron_expr expr;
+    std::unordered_map<string, Value> variables;  // Store variables for this task
 };
 
 class CronScheduler {
@@ -42,7 +45,7 @@ public:
         }
     }
 
-    string AddTask(const string &query, const string &schedule) {
+    string AddTask(const string &query, const string &schedule, ClientContext &context) {
         // Parse cron expression
         cron_expr expr;
         const char* err = NULL;
@@ -57,6 +60,12 @@ public:
         task->schedule = schedule;
         task->expr = expr;
         task->next_run = CalculateNextRun(task->expr);
+
+        // Capture current variables from the context
+        auto &config = ClientConfig::GetConfig(context);
+        for (const auto &var_pair : config.user_variables) {
+            task->variables[var_pair.first] = var_pair.second;
+        }
 
         std::lock_guard<std::mutex> lock(tasks_mutex);
         string task_id = task->id;
@@ -136,6 +145,21 @@ private:
         try {
             DuckDB db(db_instance);
             Connection conn(db);
+            
+            // Set variables before executing the query
+            for (const auto &var_pair : task.variables) {
+                string set_var_query = "SET VARIABLE " + var_pair.first + " = " + var_pair.second.ToSQLString();
+                auto set_result = conn.Query(set_var_query);
+                if (set_result->HasError()) {
+                    std::lock_guard<std::mutex> task_lock(task.mutex);
+                    task.execution_history.emplace_back(
+                        std::chrono::system_clock::now(),
+                        "Error setting variable " + var_pair.first + ": " + set_result->GetError()
+                    );
+                    return;
+                }
+            }
+            
             auto result = conn.Query(task.query);
 
             std::lock_guard<std::mutex> task_lock(task.mutex);
@@ -225,13 +249,14 @@ static void CronScalarFunction(DataChunk &args, ExpressionState &state, Vector &
 
     auto &query_vector = args.data[0];
     auto &schedule_vector = args.data[1];
+    auto &context = state.GetContext();
 
     UnaryExecutor::Execute<string_t, string_t>(
         query_vector, result, args.size(),
         [&](string_t query) {
             try {
                 auto schedule = schedule_vector.GetValue(0).ToString();
-                auto task_id = scheduler->AddTask(query.GetString(), schedule);
+                auto task_id = scheduler->AddTask(query.GetString(), schedule, context);
                 return StringVector::AddString(result, task_id);
             } catch (const Exception &e) {
                 throw InvalidInputException("Error scheduling cron task: %s", e.what());
