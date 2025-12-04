@@ -5,8 +5,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "ccronexpr.h"
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <chrono>
@@ -27,7 +28,7 @@ struct CronTask {
 
 class CronScheduler {
 public:
-    CronScheduler(DatabaseInstance &db) : db_instance(db), should_stop(false) {
+    CronScheduler(DatabaseInstance &db) : db_instance(db) {
         scheduler_thread = std::thread(&CronScheduler::RunScheduler, this);
     }
 
@@ -101,11 +102,13 @@ public:
 
 
 private:
+    static constexpr size_t MAX_EXECUTION_HISTORY = 100;
+
     DatabaseInstance &db_instance;
     std::thread scheduler_thread;
     std::mutex tasks_mutex;
     std::condition_variable condition;
-    bool should_stop;
+    std::atomic<bool> should_stop{false};
     std::atomic<size_t> task_counter{0};
     std::unordered_map<string, unique_ptr<CronTask>> tasks;
 
@@ -140,22 +143,13 @@ private:
 
             std::lock_guard<std::mutex> task_lock(task.mutex);
             if (result->HasError()) {
-                task.execution_history.emplace_back(
-                    std::chrono::system_clock::now(),
-                    "Error: " + result->GetError()
-                );
+                AddExecutionResult(task, "Error: " + result->GetError());
             } else {
-                task.execution_history.emplace_back(
-                    std::chrono::system_clock::now(),
-                    "Success"
-                );
+                AddExecutionResult(task, "Success");
             }
         } catch (const std::exception &e) {
             std::lock_guard<std::mutex> task_lock(task.mutex);
-            task.execution_history.emplace_back(
-                std::chrono::system_clock::now(),
-                "Exception: " + string(e.what())
-            );
+            AddExecutionResult(task, "Exception: " + string(e.what()));
         }
     }
 
@@ -172,6 +166,14 @@ private:
             ts.erase(ts.length()-1);
         }
         return ts;
+    }
+
+    // Add execution result to history and trim to MAX_EXECUTION_HISTORY entries
+    void AddExecutionResult(CronTask &task, const string &result) {
+        task.execution_history.emplace_back(std::chrono::system_clock::now(), result);
+        while (task.execution_history.size() > MAX_EXECUTION_HISTORY) {
+            task.execution_history.erase(task.execution_history.begin());
+        }
     }
 };
 
@@ -292,33 +294,10 @@ static void CronJobsFunction(ClientContext &context, TableFunctionInput &data_p,
     data.data_returned = true;
 }
 
-void CronjobExtension::Load(DuckDB &db) {
-    scheduler = make_uniq<CronScheduler>(*db.instance);
-    if (!scheduler) {
-        throw InternalException("Failed to initialize cron scheduler");
-    }
+static void LoadInternal(ExtensionLoader &loader);
 
-    // Register the cron scalar function
-    auto cron_func = ScalarFunction("cron", 
-                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                  LogicalType::VARCHAR,
-                                  CronScalarFunction);
-    ExtensionUtil::RegisterFunction(*db.instance, cron_func);
-
-    // Register cron_delete function
-    auto cron_delete_func = ScalarFunction("cron_delete",
-                                         {LogicalType::VARCHAR},
-                                         LogicalType::BOOLEAN,
-                                         CronDeleteFunction);
-    ExtensionUtil::RegisterFunction(*db.instance, cron_delete_func);
-
-
-
-    // Register the cron_jobs table function
-    auto cron_jobs_func = TableFunction("cron_jobs", {}, CronJobsFunction, CronJobsBind);
-    cron_jobs_func.init_global = CronJobsInit;  // Add this line
-    ExtensionUtil::RegisterFunction(*db.instance, cron_jobs_func);
-
+void CronjobExtension::Load(ExtensionLoader &loader) {
+    LoadInternal(loader);
 }
 
 std::string CronjobExtension::Name() {
@@ -333,12 +312,39 @@ std::string CronjobExtension::Version() const {
 #endif
 }
 
+static void LoadInternal(ExtensionLoader &loader) {
+    auto &db_instance = loader.GetDatabaseInstance();
+    scheduler = make_uniq<CronScheduler>(db_instance);
+    if (!scheduler) {
+        throw InternalException("Failed to initialize cron scheduler");
+    }
+
+    // Register the cron scalar function
+    auto cron_func = ScalarFunction("cron",
+                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                  LogicalType::VARCHAR,
+                                  CronScalarFunction);
+    loader.RegisterFunction(cron_func);
+
+    // Register cron_delete function
+    auto cron_delete_func = ScalarFunction("cron_delete",
+                                         {LogicalType::VARCHAR},
+                                         LogicalType::BOOLEAN,
+                                         CronDeleteFunction);
+    loader.RegisterFunction(cron_delete_func);
+
+    // Register the cron_jobs table function
+    auto cron_jobs_func = TableFunction("cron_jobs", {}, CronJobsFunction, CronJobsBind);
+    cron_jobs_func.init_global = CronJobsInit;
+    loader.RegisterFunction(cron_jobs_func);
+}
+
 } // namespace duckdb
 
 extern "C" {
-DUCKDB_EXTENSION_API void cronjob_init(duckdb::DatabaseInstance &db) {
-    duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::CronjobExtension>();
+
+DUCKDB_CPP_EXTENSION_ENTRY(cronjob, loader) {
+    duckdb::LoadInternal(loader);
 }
 
 DUCKDB_EXTENSION_API const char *cronjob_version() {
