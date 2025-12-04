@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.5)
 
 set(TARGET_NAME cronjob)
 set(CRONJOB_VERSION "2025120401")
-find_package(OpenSSL REQUIRED)
 
 # Add ccronexpr library
 add_library(ccronexpr STATIC ccronexpr/ccronexpr.c)
@@ -24,9 +23,8 @@ build_loadable_extension(${TARGET_NAME} "" ${EXTENSION_SOURCES} ccronexpr/ccrone
 target_compile_definitions(${EXTENSION_NAME} PRIVATE CRONJOB_VERSION="${CRONJOB_VERSION}")
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CRONJOB_VERSION="${CRONJOB_VERSION}")
 
-# Link OpenSSL
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${EXTENSION_NAME})
+target_link_libraries(${LOADABLE_EXTENSION_NAME})
 
 install(
   TARGETS ${EXTENSION_NAME}
