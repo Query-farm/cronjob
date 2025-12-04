@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 
 set(TARGET_NAME cronjob)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED 1)
 set(CRONJOB_VERSION "2025120401")
 
 # Add ccronexpr library
@@ -12,7 +14,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 # Set extension sources
-set(EXTENSION_SOURCES src/cronjob_extension.cpp)
+set(EXTENSION_SOURCES src/cronjob_extension.cpp src/query_farm_telemetry.cpp)
 include_directories(src/include ccronexpr)
 
 # Build extension

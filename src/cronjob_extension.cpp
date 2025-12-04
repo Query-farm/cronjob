@@ -11,343 +11,406 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include "query_farm_telemetry.hpp"
 
-namespace duckdb {
+namespace duckdb
+{
 
-// First declare CronTask
-struct CronTask {
-    string id;
-    string query;
-    string schedule;
-    bool active = true;
-    std::chrono::system_clock::time_point next_run;
-    std::vector<std::pair<std::chrono::system_clock::time_point, string>> execution_history;
-    std::mutex mutex;
-    cron_expr expr;
-};
+    // First declare CronTask
+    struct CronTask
+    {
+        string id;
+        string query;
+        string schedule;
+        bool active = true;
+        std::chrono::system_clock::time_point next_run;
+        std::vector<std::pair<std::chrono::system_clock::time_point, string>> execution_history;
+        std::mutex mutex;
+        cron_expr expr;
+    };
 
-class CronScheduler {
-public:
-    CronScheduler(DatabaseInstance &db) : db_instance(db) {
-        scheduler_thread = std::thread(&CronScheduler::RunScheduler, this);
-    }
+    class CronScheduler
+    {
+    public:
+        CronScheduler(DatabaseInstance &db) : db_instance(db)
+        {
+            scheduler_thread = std::thread(&CronScheduler::RunScheduler, this);
+        }
 
-    ~CronScheduler() {
+        ~CronScheduler()
+        {
+            {
+                std::lock_guard<std::mutex> lock(tasks_mutex);
+                should_stop = true;
+            }
+            condition.notify_one();
+            if (scheduler_thread.joinable())
+            {
+                scheduler_thread.join();
+            }
+        }
+
+        string AddTask(const string &query, const string &schedule)
+        {
+            // Parse cron expression
+            cron_expr expr;
+            const char *err = NULL;
+            cron_parse_expr(schedule.c_str(), &expr, &err);
+            if (err)
+            {
+                throw InvalidInputException("Invalid cron expression: %s", err);
+            }
+
+            auto task = make_uniq<CronTask>();
+            task->id = "task_" + std::to_string(task_counter++);
+            task->query = query;
+            task->schedule = schedule;
+            task->expr = expr;
+            task->next_run = CalculateNextRun(task->expr);
+
+            std::lock_guard<std::mutex> lock(tasks_mutex);
+            string task_id = task->id;
+            tasks[task_id] = std::move(task);
+            condition.notify_one();
+            return task_id;
+        }
+
+        void GetTasksStatus(vector<Value> &job_ids, vector<Value> &queries, vector<Value> &schedules,
+                            vector<Value> &next_runs, vector<Value> &statuses, vector<Value> &last_runs,
+                            vector<Value> &last_results)
         {
             std::lock_guard<std::mutex> lock(tasks_mutex);
-            should_stop = true;
-        }
-        condition.notify_one();
-        if (scheduler_thread.joinable()) {
-            scheduler_thread.join();
-        }
-    }
-
-    string AddTask(const string &query, const string &schedule) {
-        // Parse cron expression
-        cron_expr expr;
-        const char* err = NULL;
-        cron_parse_expr(schedule.c_str(), &expr, &err);
-        if (err) {
-            throw InvalidInputException("Invalid cron expression: %s", err);
-        }
-
-        auto task = make_uniq<CronTask>();
-        task->id = "task_" + std::to_string(task_counter++);
-        task->query = query;
-        task->schedule = schedule;
-        task->expr = expr;
-        task->next_run = CalculateNextRun(task->expr);
-
-        std::lock_guard<std::mutex> lock(tasks_mutex);
-        string task_id = task->id;
-        tasks[task_id] = std::move(task);
-        condition.notify_one();
-        return task_id;
-    }
-
-    void GetTasksStatus(vector<Value> &job_ids, vector<Value> &queries, vector<Value> &schedules,
-                       vector<Value> &next_runs, vector<Value> &statuses, vector<Value> &last_runs,
-                       vector<Value> &last_results) {
-        std::lock_guard<std::mutex> lock(tasks_mutex);
-        for (auto &task_pair : tasks) {
-            auto &task = task_pair.second;
-            std::lock_guard<std::mutex> task_lock(task->mutex);
-
-            job_ids.push_back(Value(task->id));
-            queries.push_back(Value(task->query));
-            schedules.push_back(Value(task->schedule));
-            next_runs.push_back(Value(TimeToString(task->next_run)));
-            statuses.push_back(Value(task->active ? "Active" : "Inactive"));
-
-            if (!task->execution_history.empty()) {
-                auto last_execution = task->execution_history.back();
-                last_runs.push_back(Value(TimeToString(last_execution.first)));
-                last_results.push_back(Value(last_execution.second));
-            } else {
-                last_runs.push_back(Value());
-                last_results.push_back(Value());
-            }
-        }
-    }
-
-    bool RemoveTask(const string &id) {
-        std::lock_guard<std::mutex> lock(tasks_mutex);
-        if (tasks.find(id) == tasks.end()) {
-            throw InvalidInputException("Task with ID '%s' does not exist", id);
-        }
-        tasks.erase(id);
-        return true;
-    }
-
-
-private:
-    static constexpr size_t MAX_EXECUTION_HISTORY = 100;
-
-    DatabaseInstance &db_instance;
-    std::thread scheduler_thread;
-    std::mutex tasks_mutex;
-    std::condition_variable condition;
-    std::atomic<bool> should_stop{false};
-    std::atomic<size_t> task_counter{0};
-    std::unordered_map<string, unique_ptr<CronTask>> tasks;
-
-    void RunScheduler() {
-        while (true) {
-            std::unique_lock<std::mutex> lock(tasks_mutex);
-            if (should_stop) break;
-
-            auto now = std::chrono::system_clock::now();
-            std::chrono::system_clock::time_point next_wake = now + std::chrono::hours(24);
-
-            for (auto &task_pair : tasks) {
+            for (auto &task_pair : tasks)
+            {
                 auto &task = task_pair.second;
-                if (task->active && task->next_run <= now) {
-                    ExecuteTask(*task);
-                    task->next_run = CalculateNextRun(task->expr);
+                std::lock_guard<std::mutex> task_lock(task->mutex);
+
+                job_ids.push_back(Value(task->id));
+                queries.push_back(Value(task->query));
+                schedules.push_back(Value(task->schedule));
+                next_runs.push_back(Value(TimeToString(task->next_run)));
+                statuses.push_back(Value(task->active ? "Active" : "Inactive"));
+
+                if (!task->execution_history.empty())
+                {
+                    auto last_execution = task->execution_history.back();
+                    last_runs.push_back(Value(TimeToString(last_execution.first)));
+                    last_results.push_back(Value(last_execution.second));
                 }
-                if (task->active) {
-                    next_wake = std::min(next_wake, task->next_run);
+                else
+                {
+                    last_runs.push_back(Value());
+                    last_results.push_back(Value());
                 }
             }
-
-            condition.wait_until(lock, next_wake);
         }
-    }
 
-    void ExecuteTask(CronTask &task) {
-        try {
-            DuckDB db(db_instance);
-            Connection conn(db);
-            auto result = conn.Query(task.query);
-
-            std::lock_guard<std::mutex> task_lock(task.mutex);
-            if (result->HasError()) {
-                AddExecutionResult(task, "Error: " + result->GetError());
-            } else {
-                AddExecutionResult(task, "Success");
+        bool RemoveTask(const string &id)
+        {
+            std::lock_guard<std::mutex> lock(tasks_mutex);
+            if (tasks.find(id) == tasks.end())
+            {
+                throw InvalidInputException("Task with ID '%s' does not exist", id);
             }
-        } catch (const std::exception &e) {
-            std::lock_guard<std::mutex> task_lock(task.mutex);
-            AddExecutionResult(task, "Exception: " + string(e.what()));
+            tasks.erase(id);
+            return true;
         }
-    }
 
-    std::chrono::system_clock::time_point CalculateNextRun(cron_expr &expr) {
-        time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        time_t next = cron_next(&expr, now);
-        return std::chrono::system_clock::from_time_t(next);
-    }
+    private:
+        static constexpr size_t MAX_EXECUTION_HISTORY = 100;
 
-    string TimeToString(const std::chrono::system_clock::time_point &time) {
-        auto t = std::chrono::system_clock::to_time_t(time);
-        std::string ts = std::ctime(&t);
-        if (!ts.empty() && ts[ts.length()-1] == '\n') {
-            ts.erase(ts.length()-1);
-        }
-        return ts;
-    }
+        DatabaseInstance &db_instance;
+        std::thread scheduler_thread;
+        std::mutex tasks_mutex;
+        std::condition_variable condition;
+        std::atomic<bool> should_stop{false};
+        std::atomic<size_t> task_counter{0};
+        std::unordered_map<string, unique_ptr<CronTask>> tasks;
 
-    // Add execution result to history and trim to MAX_EXECUTION_HISTORY entries
-    void AddExecutionResult(CronTask &task, const string &result) {
-        task.execution_history.emplace_back(std::chrono::system_clock::now(), result);
-        while (task.execution_history.size() > MAX_EXECUTION_HISTORY) {
-            task.execution_history.erase(task.execution_history.begin());
-        }
-    }
-};
+        void RunScheduler()
+        {
+            while (true)
+            {
+                std::unique_lock<std::mutex> lock(tasks_mutex);
+                if (should_stop)
+                    break;
 
-// Global scheduler instance
-static unique_ptr<CronScheduler> scheduler;
+                auto now = std::chrono::system_clock::now();
+                std::chrono::system_clock::time_point next_wake = now + std::chrono::hours(24);
 
-// Then the delete function
-static void CronDeleteFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    if (!scheduler) {
-        throw InternalException("Cron scheduler not initialized");
-    }
+                for (auto &task_pair : tasks)
+                {
+                    auto &task = task_pair.second;
+                    if (task->active && task->next_run <= now)
+                    {
+                        ExecuteTask(*task);
+                        task->next_run = CalculateNextRun(task->expr);
+                    }
+                    if (task->active)
+                    {
+                        next_wake = std::min(next_wake, task->next_run);
+                    }
+                }
 
-    auto &task_id_vector = args.data[0];
-    UnaryExecutor::Execute<string_t, bool>(
-        task_id_vector, result, args.size(),
-        [&](string_t task_id) {
-            try {
-                return scheduler->RemoveTask(task_id.GetString());
-            } catch (const Exception &e) {
-                throw InvalidInputException("Error deleting cron task: %s", e.what());
+                condition.wait_until(lock, next_wake);
             }
-        });
-}
+        }
 
-// Table function data structure
-struct CronJobsData : public GlobalTableFunctionState, public TableFunctionData {
-    bool data_returned = false;  // Add this flag
-    vector<Value> job_ids;
-    vector<Value> queries;
-    vector<Value> schedules;
-    vector<Value> next_runs;
-    vector<Value> statuses;
-    vector<Value> last_runs;
-    vector<Value> last_results;
+        void ExecuteTask(CronTask &task)
+        {
+            try
+            {
+                DuckDB db(db_instance);
+                Connection conn(db);
+                auto result = conn.Query(task.query);
 
-    CronJobsData() {}
-
-    idx_t MaxThreads() const override {
-        return 1;
-    }
-};
-
-static unique_ptr<GlobalTableFunctionState> CronJobsInit(ClientContext &context, TableFunctionInitInput &input) {
-    return make_uniq<CronJobsData>();
-}
-
-static void CronScalarFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    if (!scheduler) {
-        throw InternalException("Cron scheduler not initialized");
-    }
-
-    auto &query_vector = args.data[0];
-    auto &schedule_vector = args.data[1];
-
-    UnaryExecutor::Execute<string_t, string_t>(
-        query_vector, result, args.size(),
-        [&](string_t query) {
-            try {
-                auto schedule = schedule_vector.GetValue(0).ToString();
-                auto task_id = scheduler->AddTask(query.GetString(), schedule);
-                return StringVector::AddString(result, task_id);
-            } catch (const Exception &e) {
-                throw InvalidInputException("Error scheduling cron task: %s", e.what());
+                std::lock_guard<std::mutex> task_lock(task.mutex);
+                if (result->HasError())
+                {
+                    AddExecutionResult(task, "Error: " + result->GetError());
+                }
+                else
+                {
+                    AddExecutionResult(task, "Success");
+                }
             }
-        });
-}
+            catch (const std::exception &e)
+            {
+                std::lock_guard<std::mutex> task_lock(task.mutex);
+                AddExecutionResult(task, "Exception: " + string(e.what()));
+            }
+        }
 
-static unique_ptr<FunctionData> CronJobsBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
-    
-    names = {"job_id", "query", "schedule", "next_run", "status", "last_run", "last_result"};
-    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                   LogicalType::VARCHAR};
+        std::chrono::system_clock::time_point CalculateNextRun(cron_expr &expr)
+        {
+            time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            time_t next = cron_next(&expr, now);
+            return std::chrono::system_clock::from_time_t(next);
+        }
 
-    return make_uniq<CronJobsData>();
-}
+        string TimeToString(const std::chrono::system_clock::time_point &time)
+        {
+            auto t = std::chrono::system_clock::to_time_t(time);
+            std::string ts = std::ctime(&t);
+            if (!ts.empty() && ts[ts.length() - 1] == '\n')
+            {
+                ts.erase(ts.length() - 1);
+            }
+            return ts;
+        }
 
-static void CronJobsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    
-    if (!scheduler) {
-        throw InternalException("Cron scheduler not initialized");
+        // Add execution result to history and trim to MAX_EXECUTION_HISTORY entries
+        void AddExecutionResult(CronTask &task, const string &result)
+        {
+            task.execution_history.emplace_back(std::chrono::system_clock::now(), result);
+            while (task.execution_history.size() > MAX_EXECUTION_HISTORY)
+            {
+                task.execution_history.erase(task.execution_history.begin());
+            }
+        }
+    };
+
+    // Global scheduler instance
+    static unique_ptr<CronScheduler> scheduler;
+
+    // Then the delete function
+    static void CronDeleteFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    {
+        if (!scheduler)
+        {
+            throw InternalException("Cron scheduler not initialized");
+        }
+
+        auto &task_id_vector = args.data[0];
+        UnaryExecutor::Execute<string_t, bool>(
+            task_id_vector, result, args.size(),
+            [&](string_t task_id)
+            {
+                try
+                {
+                    return scheduler->RemoveTask(task_id.GetString());
+                }
+                catch (const Exception &e)
+                {
+                    throw InvalidInputException("Error deleting cron task: %s", e.what());
+                }
+            });
     }
 
-    auto &data = data_p.global_state->Cast<CronJobsData>();
+    // Table function data structure
+    struct CronJobsData : public GlobalTableFunctionState, public TableFunctionData
+    {
+        bool data_returned = false; // Add this flag
+        vector<Value> job_ids;
+        vector<Value> queries;
+        vector<Value> schedules;
+        vector<Value> next_runs;
+        vector<Value> statuses;
+        vector<Value> last_runs;
+        vector<Value> last_results;
 
-    // If we've already returned the data, we're done
-    if (data.data_returned) {
-        output.SetCardinality(0);
-        return;
+        CronJobsData() {}
+
+        idx_t MaxThreads() const override
+        {
+            return 1;
+        }
+    };
+
+    static unique_ptr<GlobalTableFunctionState> CronJobsInit(ClientContext &context, TableFunctionInitInput &input)
+    {
+        return make_uniq<CronJobsData>();
     }
 
-    // Get the data
-    scheduler->GetTasksStatus(data.job_ids, data.queries, data.schedules,
-                            data.next_runs, data.statuses, data.last_runs,
-                            data.last_results);
+    static void CronScalarFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    {
+        if (!scheduler)
+        {
+            throw InternalException("Cron scheduler not initialized");
+        }
 
-    if (data.job_ids.empty()) {
-        output.SetCardinality(0);
-        return;
+        auto &query_vector = args.data[0];
+        auto &schedule_vector = args.data[1];
+
+        UnaryExecutor::Execute<string_t, string_t>(
+            query_vector, result, args.size(),
+            [&](string_t query)
+            {
+                try
+                {
+                    auto schedule = schedule_vector.GetValue(0).ToString();
+                    auto task_id = scheduler->AddTask(query.GetString(), schedule);
+                    return StringVector::AddString(result, task_id);
+                }
+                catch (const Exception &e)
+                {
+                    throw InvalidInputException("Error scheduling cron task: %s", e.what());
+                }
+            });
     }
 
-    idx_t chunk_size = data.job_ids.size();
+    static unique_ptr<FunctionData> CronJobsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names)
+    {
 
-    output.SetCardinality(chunk_size);
+        names = {"job_id", "query", "schedule", "next_run", "status", "last_run", "last_result"};
+        return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+                        LogicalType::VARCHAR};
 
-    for (idx_t i = 0; i < chunk_size; i++) {
-        output.data[0].SetValue(i, data.job_ids[i]);
-        output.data[1].SetValue(i, data.queries[i]);
-        output.data[2].SetValue(i, data.schedules[i]);
-        output.data[3].SetValue(i, data.next_runs[i]);
-        output.data[4].SetValue(i, data.statuses[i]);
-        output.data[5].SetValue(i, data.last_runs[i]);
-        output.data[6].SetValue(i, data.last_results[i]);
+        return make_uniq<CronJobsData>();
     }
 
-    // Mark that we've returned the data
-    data.data_returned = true;
-}
+    static void CronJobsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
+    {
 
-static void LoadInternal(ExtensionLoader &loader);
+        if (!scheduler)
+        {
+            throw InternalException("Cron scheduler not initialized");
+        }
 
-void CronjobExtension::Load(ExtensionLoader &loader) {
-    LoadInternal(loader);
-}
+        auto &data = data_p.global_state->Cast<CronJobsData>();
 
-std::string CronjobExtension::Name() {
-    return "cronjob";
-}
+        // If we've already returned the data, we're done
+        if (data.data_returned)
+        {
+            output.SetCardinality(0);
+            return;
+        }
 
-std::string CronjobExtension::Version() const {
+        // Get the data
+        scheduler->GetTasksStatus(data.job_ids, data.queries, data.schedules,
+                                  data.next_runs, data.statuses, data.last_runs,
+                                  data.last_results);
+
+        if (data.job_ids.empty())
+        {
+            output.SetCardinality(0);
+            return;
+        }
+
+        idx_t chunk_size = data.job_ids.size();
+
+        output.SetCardinality(chunk_size);
+
+        for (idx_t i = 0; i < chunk_size; i++)
+        {
+            output.data[0].SetValue(i, data.job_ids[i]);
+            output.data[1].SetValue(i, data.queries[i]);
+            output.data[2].SetValue(i, data.schedules[i]);
+            output.data[3].SetValue(i, data.next_runs[i]);
+            output.data[4].SetValue(i, data.statuses[i]);
+            output.data[5].SetValue(i, data.last_runs[i]);
+            output.data[6].SetValue(i, data.last_results[i]);
+        }
+
+        // Mark that we've returned the data
+        data.data_returned = true;
+    }
+
+    static void LoadInternal(ExtensionLoader &loader);
+
+    void CronjobExtension::Load(ExtensionLoader &loader)
+    {
+        LoadInternal(loader);
+    }
+
+    std::string CronjobExtension::Name()
+    {
+        return "cronjob";
+    }
+
+    std::string CronjobExtension::Version() const
+    {
 #ifdef CRONJOB_VERSION
-    return CRONJOB_VERSION;
+        return CRONJOB_VERSION;
 #else
-    return "0.0.1";
+        return "0.0.1";
 #endif
-}
-
-static void LoadInternal(ExtensionLoader &loader) {
-    auto &db_instance = loader.GetDatabaseInstance();
-    scheduler = make_uniq<CronScheduler>(db_instance);
-    if (!scheduler) {
-        throw InternalException("Failed to initialize cron scheduler");
     }
 
-    // Register the cron scalar function
-    auto cron_func = ScalarFunction("cron",
-                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                  LogicalType::VARCHAR,
-                                  CronScalarFunction);
-    loader.RegisterFunction(cron_func);
+    static void LoadInternal(ExtensionLoader &loader)
+    {
+        auto &db_instance = loader.GetDatabaseInstance();
+        scheduler = make_uniq<CronScheduler>(db_instance);
+        if (!scheduler)
+        {
+            throw InternalException("Failed to initialize cron scheduler");
+        }
 
-    // Register cron_delete function
-    auto cron_delete_func = ScalarFunction("cron_delete",
-                                         {LogicalType::VARCHAR},
-                                         LogicalType::BOOLEAN,
-                                         CronDeleteFunction);
-    loader.RegisterFunction(cron_delete_func);
+        // Register the cron scalar function
+        auto cron_func = ScalarFunction("cron",
+                                        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                        LogicalType::VARCHAR,
+                                        CronScalarFunction);
+        loader.RegisterFunction(cron_func);
 
-    // Register the cron_jobs table function
-    auto cron_jobs_func = TableFunction("cron_jobs", {}, CronJobsFunction, CronJobsBind);
-    cron_jobs_func.init_global = CronJobsInit;
-    loader.RegisterFunction(cron_jobs_func);
-}
+        // Register cron_delete function
+        auto cron_delete_func = ScalarFunction("cron_delete",
+                                               {LogicalType::VARCHAR},
+                                               LogicalType::BOOLEAN,
+                                               CronDeleteFunction);
+        loader.RegisterFunction(cron_delete_func);
 
+        // Register the cron_jobs table function
+        auto cron_jobs_func = TableFunction("cron_jobs", {}, CronJobsFunction, CronJobsBind);
+        cron_jobs_func.init_global = CronJobsInit;
+        loader.RegisterFunction(cron_jobs_func);
+
+        QueryFarmSendTelemetry(loader, "cronjob", "2025120401");
+    }
 } // namespace duckdb
 
-extern "C" {
+extern "C"
+{
 
-DUCKDB_CPP_EXTENSION_ENTRY(cronjob, loader) {
-    duckdb::LoadInternal(loader);
-}
+    DUCKDB_CPP_EXTENSION_ENTRY(cronjob, loader)
+    {
+        duckdb::LoadInternal(loader);
+    }
 
-DUCKDB_EXTENSION_API const char *cronjob_version() {
-    return duckdb::DuckDB::LibraryVersion();
-}
+    DUCKDB_EXTENSION_API const char *cronjob_version()
+    {
+        return duckdb::DuckDB::LibraryVersion();
+    }
 }
