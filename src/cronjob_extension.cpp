@@ -397,7 +397,7 @@ namespace duckdb
         cron_jobs_func.init_global = CronJobsInit;
         loader.RegisterFunction(cron_jobs_func);
 
-        QueryFarmSendTelemetry(loader, "cronjob", "2025120401");
+        QueryFarmSendTelemetry(loader, "cronjob", "2026072501");
     }
 } // namespace duckdb
 
