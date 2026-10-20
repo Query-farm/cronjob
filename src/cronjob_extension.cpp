@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "ccronexpr.h"
 #include <atomic>
 #include <thread>
@@ -223,7 +224,7 @@ namespace duckdb
 
         auto &task_id_vector = args.data[0];
         UnaryExecutor::Execute<string_t, bool>(
-            task_id_vector, result, args.size(),
+            task_id_vector, result,
             [&](string_t task_id)
             {
                 try
@@ -273,7 +274,7 @@ namespace duckdb
         auto &schedule_vector = args.data[1];
 
         UnaryExecutor::Execute<string_t, string_t>(
-            query_vector, result, args.size(),
+            query_vector, result,
             [&](string_t query)
             {
                 try
@@ -290,7 +291,7 @@ namespace duckdb
     }
 
     static unique_ptr<FunctionData> CronJobsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names)
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names)
     {
 
         names = {"job_id", "query", "schedule", "next_run", "status", "last_run", "last_result"};
@@ -314,7 +315,7 @@ namespace duckdb
         // If we've already returned the data, we're done
         if (data.data_returned)
         {
-            output.SetCardinality(0);
+            output.SetChildCardinality(0);
             return;
         }
 
@@ -325,13 +326,13 @@ namespace duckdb
 
         if (data.job_ids.empty())
         {
-            output.SetCardinality(0);
+            output.SetChildCardinality(0);
             return;
         }
 
         idx_t chunk_size = data.job_ids.size();
 
-        output.SetCardinality(chunk_size);
+        output.SetChildCardinality(chunk_size);
 
         for (idx_t i = 0; i < chunk_size; i++)
         {
@@ -383,6 +384,7 @@ namespace duckdb
                                         {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                         LogicalType::VARCHAR,
                                         CronScalarFunction);
+        cron_func.SetFallible();
         loader.RegisterFunction(cron_func);
 
         // Register cron_delete function
@@ -390,6 +392,7 @@ namespace duckdb
                                                {LogicalType::VARCHAR},
                                                LogicalType::BOOLEAN,
                                                CronDeleteFunction);
+        cron_delete_func.SetFallible();
         loader.RegisterFunction(cron_delete_func);
 
         // Register the cron_jobs table function
