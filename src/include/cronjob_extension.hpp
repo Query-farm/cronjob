@@ -4,8 +4,6 @@
 
 namespace duckdb {
 
-class ExtensionLoader;
-
 class CronjobExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;

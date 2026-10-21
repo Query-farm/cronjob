@@ -2,31 +2,17 @@ cmake_minimum_required(VERSION 3.5)
 
 set(TARGET_NAME cronjob)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED 1)
-set(CRONJOB_VERSION "2026102002")
-
-# Add ccronexpr library
-add_library(ccronexpr STATIC ccronexpr/ccronexpr.c)
-target_include_directories(ccronexpr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ccronexpr)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
+
 project(${TARGET_NAME})
+include_directories(src/include)
 
-# Set extension sources
-set(EXTENSION_SOURCES src/cronjob_extension.cpp src/query_farm_telemetry.cpp)
-include_directories(src/include ccronexpr)
+set(EXTENSION_SOURCES src/cronjob_extension.cpp)
 
-# Build extension
-build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ccronexpr/ccronexpr.c)
-build_loadable_extension(${TARGET_NAME} "" ${EXTENSION_SOURCES} ccronexpr/ccronexpr.c)
-
-# Add version definition
-target_compile_definitions(${EXTENSION_NAME} PRIVATE CRONJOB_VERSION="${CRONJOB_VERSION}")
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CRONJOB_VERSION="${CRONJOB_VERSION}")
-
-target_link_libraries(${EXTENSION_NAME})
-target_link_libraries(${LOADABLE_EXTENSION_NAME})
+build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
+build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 install(
   TARGETS ${EXTENSION_NAME}

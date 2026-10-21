@@ -6,6 +6,3 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
-[submodule "ccronexpr"]
-	path = ccronexpr
-	url = https://github.com/staticlibs/ccronexpr

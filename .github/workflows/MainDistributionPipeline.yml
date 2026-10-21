@@ -2,12 +2,11 @@ name: Main Extension Distribution Pipeline
 on:
   push:
     branches:
-    - v2.0
+    - v2.0-community-stub
   pull_request: null
   workflow_dispatch: null
 concurrency:
-  group:
-    ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{
     github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
 jobs:
