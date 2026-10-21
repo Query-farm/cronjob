@@ -13,11 +13,14 @@
 #include <mutex>
 #include <chrono>
 #include "query_farm_telemetry.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/storage/object_cache.hpp"
+#include <condition_variable>
+#include <unordered_map>
 
 namespace duckdb
 {
 
-    // First declare CronTask
     struct CronTask
     {
         string id;
@@ -26,29 +29,68 @@ namespace duckdb
         bool active = true;
         std::chrono::system_clock::time_point next_run;
         std::vector<std::pair<std::chrono::system_clock::time_point, string>> execution_history;
-        std::mutex mutex;
         cron_expr expr;
     };
 
-    class CronScheduler
+    // State shared between a CronScheduler and its worker thread. The worker
+    // holds its own reference, so the state stays valid even in the rare case
+    // where the worker itself ends up destroying the database (and with it the
+    // CronScheduler) by releasing the last reference to it after running a task.
+    struct CronSchedulerState
+    {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool should_stop = false;
+        size_t task_counter = 0;
+        std::unordered_map<string, unique_ptr<CronTask>> tasks;
+        // Never a strong reference: the scheduler must not keep the database alive.
+        weak_ptr<DatabaseInstance> db;
+    };
+
+    // One scheduler per database, owned by the database's ObjectCache.
+    //
+    // The scheduler used to be a process-wide static whose worker thread was only
+    // stopped by the static destructor at process exit. That is too late: on
+    // Windows/MinGW the other threads have already been terminated by then, and
+    // tearing down the condition variable the dead worker was blocked on hangs
+    // forever (the unittest process never exits). It also left the worker holding
+    // a dangling DatabaseInstance reference once the database was closed.
+    //
+    // Living in the ObjectCache ties the worker to the database instead:
+    // ~DatabaseInstance destroys the cache while every thread is still alive, and
+    // the destructor below stops and joins the worker there.
+    class CronScheduler : public ObjectCacheEntry
     {
     public:
-        CronScheduler(DatabaseInstance &db) : db_instance(db)
+        static constexpr const char *CACHE_KEY = "cronjob_scheduler";
+
+        explicit CronScheduler(DatabaseInstance &db) : state(make_shared_ptr<CronSchedulerState>())
         {
-            scheduler_thread = std::thread(&CronScheduler::RunScheduler, this);
+            state->db = db.shared_from_this();
+            auto worker_state = state;
+            scheduler_thread = std::thread([worker_state]()
+                                           { RunScheduler(worker_state); });
         }
 
-        ~CronScheduler()
+        ~CronScheduler() override
         {
-            {
-                std::lock_guard<std::mutex> lock(tasks_mutex);
-                should_stop = true;
-            }
-            condition.notify_one();
-            if (scheduler_thread.joinable())
-            {
-                scheduler_thread.join();
-            }
+            Stop();
+        }
+
+        static string ObjectType()
+        {
+            return "cronjob_scheduler";
+        }
+
+        string GetObjectType() override
+        {
+            return ObjectType();
+        }
+
+        // Not evictable: the scheduler must live exactly as long as the database.
+        optional_idx GetEstimatedCacheMemory() const override
+        {
+            return optional_idx();
         }
 
         string AddTask(const string &query, const string &schedule)
@@ -63,16 +105,19 @@ namespace duckdb
             }
 
             auto task = make_uniq<CronTask>();
-            task->id = "task_" + std::to_string(task_counter++);
             task->query = query;
             task->schedule = schedule;
             task->expr = expr;
             task->next_run = CalculateNextRun(task->expr);
 
-            std::lock_guard<std::mutex> lock(tasks_mutex);
-            string task_id = task->id;
-            tasks[task_id] = std::move(task);
-            condition.notify_one();
+            string task_id;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                task_id = "task_" + std::to_string(state->task_counter++);
+                task->id = task_id;
+                state->tasks[task_id] = std::move(task);
+            }
+            state->condition.notify_one();
             return task_id;
         }
 
@@ -80,11 +125,10 @@ namespace duckdb
                             vector<Value> &next_runs, vector<Value> &statuses, vector<Value> &last_runs,
                             vector<Value> &last_results)
         {
-            std::lock_guard<std::mutex> lock(tasks_mutex);
-            for (auto &task_pair : tasks)
+            std::lock_guard<std::mutex> lock(state->mutex);
+            for (auto &task_pair : state->tasks)
             {
                 auto &task = task_pair.second;
-                std::lock_guard<std::mutex> task_lock(task->mutex);
 
                 job_ids.push_back(Value(task->id));
                 queries.push_back(Value(task->query));
@@ -94,7 +138,7 @@ namespace duckdb
 
                 if (!task->execution_history.empty())
                 {
-                    auto last_execution = task->execution_history.back();
+                    auto &last_execution = task->execution_history.back();
                     last_runs.push_back(Value(TimeToString(last_execution.first)));
                     last_results.push_back(Value(last_execution.second));
                 }
@@ -108,88 +152,144 @@ namespace duckdb
 
         bool RemoveTask(const string &id)
         {
-            std::lock_guard<std::mutex> lock(tasks_mutex);
-            if (tasks.find(id) == tasks.end())
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->tasks.find(id) == state->tasks.end())
             {
                 throw InvalidInputException("Task with ID '%s' does not exist", id);
             }
-            tasks.erase(id);
+            state->tasks.erase(id);
             return true;
         }
 
     private:
         static constexpr size_t MAX_EXECUTION_HISTORY = 100;
 
-        DatabaseInstance &db_instance;
+        shared_ptr<CronSchedulerState> state;
         std::thread scheduler_thread;
-        std::mutex tasks_mutex;
-        std::condition_variable condition;
-        std::atomic<bool> should_stop{false};
-        std::atomic<size_t> task_counter{0};
-        std::unordered_map<string, unique_ptr<CronTask>> tasks;
 
-        void RunScheduler()
+        void Stop()
         {
-            while (true)
             {
-                std::unique_lock<std::mutex> lock(tasks_mutex);
-                if (should_stop)
-                    break;
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->should_stop = true;
+            }
+            state->condition.notify_all();
+            if (!scheduler_thread.joinable())
+            {
+                return;
+            }
+            if (scheduler_thread.get_id() == std::this_thread::get_id())
+            {
+                // The worker released the last reference to the database and is
+                // running its destructor. It cannot join itself; it only touches
+                // the shared state from here on and exits as soon as it sees
+                // should_stop.
+                scheduler_thread.detach();
+            }
+            else
+            {
+                scheduler_thread.join();
+            }
+        }
 
+        static void RunScheduler(shared_ptr<CronSchedulerState> s)
+        {
+            std::unique_lock<std::mutex> lock(s->mutex);
+            while (!s->should_stop)
+            {
                 auto now = std::chrono::system_clock::now();
-                std::chrono::system_clock::time_point next_wake = now + std::chrono::hours(24);
 
-                for (auto &task_pair : tasks)
+                // Collect the due tasks; they run without the lock held, so a
+                // slow query does not block cron()/cron_jobs()/cron_delete() and
+                // shutdown can always acquire the lock.
+                vector<std::pair<string, string>> due;
+                for (auto &task_pair : s->tasks)
                 {
                     auto &task = task_pair.second;
                     if (task->active && task->next_run <= now)
                     {
-                        ExecuteTask(*task);
-                        task->next_run = CalculateNextRun(task->expr);
+                        due.emplace_back(task->id, task->query);
                     }
+                }
+
+                if (!due.empty())
+                {
+                    for (auto &entry : due)
+                    {
+                        if (s->should_stop)
+                        {
+                            break;
+                        }
+                        lock.unlock();
+                        auto result = ExecuteQuery(s, entry.second);
+                        lock.lock();
+                        // The task may have been removed while it was running.
+                        auto it = s->tasks.find(entry.first);
+                        if (it != s->tasks.end())
+                        {
+                            AddExecutionResult(*it->second, result);
+                            it->second->next_run = CalculateNextRun(it->second->expr);
+                        }
+                    }
+                    continue;
+                }
+
+                std::chrono::system_clock::time_point next_wake = now + std::chrono::hours(24);
+                for (auto &task_pair : s->tasks)
+                {
+                    auto &task = task_pair.second;
                     if (task->active)
                     {
                         next_wake = std::min(next_wake, task->next_run);
                     }
                 }
 
-                condition.wait_until(lock, next_wake);
+                s->condition.wait_until(lock, next_wake);
             }
         }
 
-        void ExecuteTask(CronTask &task)
+        static string ExecuteQuery(const shared_ptr<CronSchedulerState> &s, const string &query)
         {
             try
             {
-                DuckDB db(db_instance);
-                Connection conn(db);
-                auto result = conn.Query(task.query);
-
-                std::lock_guard<std::mutex> task_lock(task.mutex);
-                if (result->HasError())
+                auto db = s->db.lock();
+                if (!db)
                 {
-                    AddExecutionResult(task, "Error: " + result->GetError());
+                    return "Error: database is closed";
                 }
-                else
+                string result;
                 {
-                    AddExecutionResult(task, "Success");
+                    Connection conn(*db);
+                    auto query_result = conn.Query(query);
+                    if (query_result->HasError())
+                    {
+                        result = "Error: " + query_result->GetError();
+                    }
+                    else
+                    {
+                        result = "Success";
+                    }
                 }
+                // If this was the last reference, the database (and the
+                // CronScheduler that owns this thread) is destroyed right here;
+                // see Stop().
+                db.reset();
+                return result;
             }
             catch (const std::exception &e)
             {
-                std::lock_guard<std::mutex> task_lock(task.mutex);
-                AddExecutionResult(task, "Exception: " + string(e.what()));
+                return "Exception: " + string(e.what());
             }
         }
 
-        std::chrono::system_clock::time_point CalculateNextRun(cron_expr &expr)
+        static std::chrono::system_clock::time_point CalculateNextRun(cron_expr &expr)
         {
             time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             time_t next = cron_next(&expr, now);
             return std::chrono::system_clock::from_time_t(next);
         }
 
-        string TimeToString(const std::chrono::system_clock::time_point &time)
+        static string TimeToString(const std::chrono::system_clock::time_point &time)
         {
             auto t = std::chrono::system_clock::to_time_t(time);
             std::string ts = std::ctime(&t);
@@ -201,7 +301,7 @@ namespace duckdb
         }
 
         // Add execution result to history and trim to MAX_EXECUTION_HISTORY entries
-        void AddExecutionResult(CronTask &task, const string &result)
+        static void AddExecutionResult(CronTask &task, const string &result)
         {
             task.execution_history.emplace_back(std::chrono::system_clock::now(), result);
             while (task.execution_history.size() > MAX_EXECUTION_HISTORY)
@@ -211,16 +311,20 @@ namespace duckdb
         }
     };
 
-    // Global scheduler instance
-    static unique_ptr<CronScheduler> scheduler;
-
-    // Then the delete function
-    static void CronDeleteFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    static shared_ptr<CronScheduler> GetScheduler(ClientContext &context)
     {
+        auto scheduler = ObjectCache::GetObjectCache(context).Get<CronScheduler>(CronScheduler::CACHE_KEY);
         if (!scheduler)
         {
             throw InternalException("Cron scheduler not initialized");
         }
+        return scheduler;
+    }
+
+    // Then the delete function
+    static void CronDeleteFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    {
+        auto scheduler = GetScheduler(state.GetContext());
 
         auto &task_id_vector = args.data[0];
         UnaryExecutor::Execute<string_t, bool>(
@@ -265,10 +369,7 @@ namespace duckdb
 
     static void CronScalarFunction(DataChunk &args, ExpressionState &state, Vector &result)
     {
-        if (!scheduler)
-        {
-            throw InternalException("Cron scheduler not initialized");
-        }
+        auto scheduler = GetScheduler(state.GetContext());
 
         auto &query_vector = args.data[0];
         auto &schedule_vector = args.data[1];
@@ -304,11 +405,7 @@ namespace duckdb
 
     static void CronJobsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
     {
-
-        if (!scheduler)
-        {
-            throw InternalException("Cron scheduler not initialized");
-        }
+        auto scheduler = GetScheduler(context);
 
         auto &data = data_p.global_state->Cast<CronJobsData>();
 
@@ -373,7 +470,8 @@ namespace duckdb
     static void LoadInternal(ExtensionLoader &loader)
     {
         auto &db_instance = loader.GetDatabaseInstance();
-        scheduler = make_uniq<CronScheduler>(db_instance);
+        // One scheduler per database; loading the extension again reuses it.
+        auto scheduler = db_instance.GetObjectCache().GetOrCreate<CronScheduler>(CronScheduler::CACHE_KEY, db_instance);
         if (!scheduler)
         {
             throw InternalException("Failed to initialize cron scheduler");
@@ -400,7 +498,7 @@ namespace duckdb
         cron_jobs_func.init_global = CronJobsInit;
         loader.RegisterFunction(cron_jobs_func);
 
-        QueryFarmSendTelemetry(loader, "cronjob", "2026102001");
+        QueryFarmSendTelemetry(loader, "cronjob", "2026102002");
     }
 } // namespace duckdb
 

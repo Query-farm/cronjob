@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.5)
 set(TARGET_NAME cronjob)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED 1)
-set(CRONJOB_VERSION "2026102001")
+set(CRONJOB_VERSION "2026102002")
 
 # Add ccronexpr library
 add_library(ccronexpr STATIC ccronexpr/ccronexpr.c)
