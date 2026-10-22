@@ -16,6 +16,16 @@ cron_jobs	[]
 # The parameters are still positional: calls work as before
 
 query I
-SELECT cron_delete(job_id) FROM (SELECT cron('SELECT 1', '*/10 * * * * *') AS job_id);
+SELECT cron('SELECT 1', '*/10 * * * * *') LIKE 'task_%';
 ----
 true
+
+query I
+SELECT cron_delete(job_id) FROM cron_jobs();
+----
+true
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
