@@ -446,6 +446,11 @@ namespace duckdb
         data.data_returned = true;
     }
 
+    // Declares a positional-only parameter with a real name, so duckdb_functions() reports it instead of col<N>.
+    static FunctionParameter Positional(const char *name, LogicalType type) {
+        return FunctionParameter(name, std::move(type), {}, FunctionParameterKind::POSITIONAL_ONLY);
+    }
+
     static void LoadInternal(ExtensionLoader &loader);
 
     void CronjobExtension::Load(ExtensionLoader &loader)
@@ -479,7 +484,7 @@ namespace duckdb
 
         // Register the cron scalar function
         auto cron_func = ScalarFunction("cron",
-                                        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                        {Positional("query", LogicalType::VARCHAR), Positional("schedule", LogicalType::VARCHAR)},
                                         LogicalType::VARCHAR,
                                         CronScalarFunction);
         cron_func.SetFallible();
@@ -487,7 +492,7 @@ namespace duckdb
 
         // Register cron_delete function
         auto cron_delete_func = ScalarFunction("cron_delete",
-                                               {LogicalType::VARCHAR},
+                                               {Positional("job_id", LogicalType::VARCHAR)},
                                                LogicalType::BOOLEAN,
                                                CronDeleteFunction);
         cron_delete_func.SetFallible();
@@ -498,7 +503,7 @@ namespace duckdb
         cron_jobs_func.init_global = CronJobsInit;
         loader.RegisterFunction(cron_jobs_func);
 
-        QueryFarmSendTelemetry(loader, "cronjob", "2026102002");
+        QueryFarmSendTelemetry(loader, "cronjob", "2026102101");
     }
 } // namespace duckdb
 

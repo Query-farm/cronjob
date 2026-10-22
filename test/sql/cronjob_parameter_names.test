@@ -1,0 +1,21 @@
+# name: test/sql/cronjob_parameter_names.test
+# description: duckdb_functions() reports the declared parameter names instead of col<N>
+# group: [cronjob]
+
+require cronjob
+
+query II
+SELECT DISTINCT function_name, parameters FROM duckdb_functions()
+WHERE function_name IN ('cron', 'cron_delete', 'cron_jobs')
+ORDER BY ALL;
+----
+cron	[query, schedule]
+cron_delete	[job_id]
+cron_jobs	[]
+
+# The parameters are still positional: calls work as before
+
+query I
+SELECT cron_delete(job_id) FROM (SELECT cron('SELECT 1', '*/10 * * * * *') AS job_id);
+----
+true
