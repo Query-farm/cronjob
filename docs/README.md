@@ -7,24 +7,15 @@
   </a>
 </p>
 
-# DuckDB CronJob Extension
+# Cronjob Extension for DuckDB
 
-[![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/cronjob.html)
-[![v1.5 build](https://github.com/Query-farm/cronjob/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v1.5)](https://github.com/Query-farm/cronjob/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av1.5)
+[![DuckDB](https://img.shields.io/badge/DuckDB-extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://query.farm/products/extensions/cronjob/)
+[![v2.0 build](https://github.com/Query-farm/cronjob/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v2.0)](https://github.com/Query-farm/cronjob/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av2.0)
 
-The DuckDB Cron extension adds support for scheduled query execution within DuckDB. It allows you to schedule SQL queries to run periodically using standard cron expressions while your DuckDB process is active.
-
-> Experimental: USE AT YOUR OWN RISK!
+Schedule SQL queries using cron expressions while your DuckDB process is running. Experimental.
 
 ## Documentation
 
 Full documentation, including installation, usage, the function reference, and cookbook examples, is available at:
 
-**[https://query.farm/products/extensions/cronjob](https://query.farm/products/extensions/cronjob)**
-
-## Installation
-
-```sql
-INSTALL cronjob FROM community;
-LOAD cronjob;
-```
+**[https://query.farm/products/extensions/cronjob/](https://query.farm/products/extensions/cronjob/)**
