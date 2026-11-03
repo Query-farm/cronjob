@@ -26,6 +26,9 @@ jobs:
         main:
           config: extension_config.cmake
           toolchain: main
+      # The extension starts a thread on load, which DuckDB-Wasm rejects
+      # ("thread constructor failed: Not supported").
+      exclude_archs: wasm_mvp;wasm_eh;wasm_threads
     secrets:
       ccache_remote_token: ${{ secrets.QUERY_FARM_CCACHE_TOKEN }}
   duckdb-deploy:
