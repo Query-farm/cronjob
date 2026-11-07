@@ -1,0 +1,61 @@
+# name: test/sql/cronjob_table_args.test
+# description: per-row arguments from table columns, and listings larger than one vector
+# group: [cronjob]
+
+require cronjob
+
+statement ok
+CREATE TABLE specs (q VARCHAR, s VARCHAR);
+
+statement ok
+INSERT INTO specs VALUES ('SELECT 1', '0 0 0 1 1 *'), ('SELECT 2', '0 30 12 * * MON'), (NULL, '0 0 0 1 1 *'), ('SELECT 3', NULL), ('SELECT 4', '0 0 6 1 */3 *');
+
+query I
+SELECT count(cron(q, s)) FROM specs;
+----
+3
+
+# Every row keeps its own schedule.
+query II
+SELECT query, schedule FROM cron_jobs() ORDER BY query;
+----
+SELECT 1	0 0 0 1 1 *
+SELECT 2	0 30 12 * * MON
+SELECT 4	0 0 6 1 */3 *
+
+# One bad row fails the whole statement.
+statement error
+SELECT cron(q, s) FROM (VALUES ('SELECT 5', '0 0 0 1 1 *'), ('SELECT 6', 'bogus')) t(q, s);
+----
+Invalid cron schedule 'bogus'
+
+query I
+SELECT count(cron_delete(job_id)) FROM cron_jobs();
+----
+4
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+# cron_jobs() pages through more jobs than fit in one vector.
+query I
+SELECT count(cron('SELECT ' || i, '0 0 0 1 1 *')) FROM range(5000) t(i);
+----
+5000
+
+query III
+SELECT count(*), count(DISTINCT job_id), count(DISTINCT query) FROM cron_jobs();
+----
+5000	5000	5000
+
+query I
+SELECT count(cron_delete(job_id)) FROM cron_jobs();
+----
+5000
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0

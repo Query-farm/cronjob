@@ -1,0 +1,49 @@
+# name: test/sql/cronjob_restart.test
+# description: the scheduler belongs to its database and stops when the database closes
+# group: [cronjob]
+
+require cronjob
+
+load __TEST_DIR__/cronjob_restart.db
+
+statement ok
+CREATE TABLE ticks (ts TIMESTAMPTZ DEFAULT now());
+
+statement ok
+SELECT cron('INSERT INTO ticks DEFAULT VALUES', '* * * * * *');
+
+sleep 2 seconds
+
+query I
+SELECT count(*) >= 1 FROM ticks;
+----
+true
+
+# Closing the database stops and joins its scheduler; jobs are not persisted.
+restart
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+statement ok
+CREATE TABLE snapshot AS SELECT count(*) AS n FROM ticks;
+
+sleep 2 seconds
+
+query I
+SELECT (SELECT count(*) FROM ticks) - n FROM snapshot;
+----
+0
+
+# Job ids start over in the new database.
+query I
+SELECT cron('SELECT 1', '0 0 0 1 1 *');
+----
+task_0
+
+query I
+SELECT cron_delete('task_0');
+----
+true

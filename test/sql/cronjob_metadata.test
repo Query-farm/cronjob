@@ -1,0 +1,66 @@
+# name: test/sql/cronjob_metadata.test
+# description: every cronjob function is documented in duckdb_functions() with real parameter names
+# group: [cronjob]
+
+require cronjob
+
+query IIII
+SELECT function_name, function_type, parameters, parameter_types
+FROM duckdb_functions()
+WHERE function_name IN ('cron', 'cron_delete', 'cron_jobs', 'cron_job_history')
+ORDER BY function_name;
+----
+cron	scalar	[query, schedule]	[VARCHAR, VARCHAR]
+cron_delete	scalar	[job_id]	[VARCHAR]
+cron_job_history	table	[]	[]
+cron_jobs	table	[]	[]
+
+# Every function has a description, at least one example and a category.
+query I
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name IN ('cron', 'cron_delete', 'cron_jobs', 'cron_job_history')
+  AND (description IS NULL OR description = '' OR len(examples) = 0 OR len(categories) = 0)
+ORDER BY function_name;
+----
+
+query II
+SELECT function_name, categories FROM duckdb_functions()
+WHERE function_name IN ('cron', 'cron_delete', 'cron_jobs', 'cron_job_history')
+ORDER BY function_name;
+----
+cron	[scheduling]
+cron_delete	[scheduling]
+cron_job_history	[scheduling]
+cron_jobs	[scheduling]
+
+query II
+SELECT function_name, return_type FROM duckdb_functions()
+WHERE function_name IN ('cron', 'cron_delete')
+ORDER BY function_name;
+----
+cron	VARCHAR
+cron_delete	BOOLEAN
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM cron_jobs());
+----
+job_id	VARCHAR
+query	VARCHAR
+schedule	VARCHAR
+next_run	TIMESTAMP WITH TIME ZONE
+status	VARCHAR
+last_run	TIMESTAMP WITH TIME ZONE
+last_result	VARCHAR
+run_count	BIGINT
+error_count	BIGINT
+created_at	TIMESTAMP WITH TIME ZONE
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM cron_job_history());
+----
+job_id	VARCHAR
+started_at	TIMESTAMP WITH TIME ZONE
+finished_at	TIMESTAMP WITH TIME ZONE
+success	BOOLEAN
+result	VARCHAR

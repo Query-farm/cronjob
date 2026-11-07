@@ -1,0 +1,134 @@
+# name: test/sql/cronjob_errors.test
+# description: invalid and impossible schedules, invalid queries and NULL arguments
+# group: [cronjob]
+
+require cronjob
+
+statement error
+SELECT cron('SELECT 1', 'not a schedule');
+----
+Invalid cron schedule 'not a schedule'
+
+statement error
+SELECT cron('SELECT 1', '');
+----
+Invalid cron schedule
+
+# Five-field (classic crontab) expressions are rejected: the first field is seconds.
+statement error
+SELECT cron('SELECT 1', '* * * * *');
+----
+Invalid cron schedule
+
+statement error
+SELECT cron('SELECT 1', '* * * * * * *');
+----
+Invalid cron schedule
+
+statement error
+SELECT cron('SELECT 1', '61 * * * * *');
+----
+Invalid cron schedule
+
+statement error
+SELECT cron('SELECT 1', '99999999999999999999 * * * * *');
+----
+Invalid cron schedule
+
+statement error
+SELECT cron('SELECT 1', '🦆 * * * * *');
+----
+Invalid cron schedule
+
+statement error
+SELECT cron('SELECT 1', repeat('* ', 200));
+----
+limited to 255 characters
+
+statement error
+SELECT cron('SELECT 1', '* * * * * *' || chr(0) || 'x');
+----
+NUL character
+
+# February 30th never happens: rejected instead of running continuously.
+statement error
+SELECT cron('SELECT 1', '0 0 0 30 2 *');
+----
+never matches a real date
+
+statement error
+SELECT cron('SELECT 1', '0 0 0 31 4 *');
+----
+never matches a real date
+
+# The query is checked for syntax errors up front.
+statement error
+SELECT cron('SELEC 1', '* * * * * *');
+----
+Invalid cron query
+
+statement error
+SELECT cron('', '* * * * * *');
+----
+contains no SQL statement
+
+statement error
+SELECT cron('  ;  ', '* * * * * *');
+----
+contains no SQL statement
+
+# Nothing was scheduled by the failures above.
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+# NULL arguments schedule nothing and return NULL.
+query I
+SELECT cron(NULL, '* * * * * *') IS NULL;
+----
+true
+
+query I
+SELECT cron('SELECT 1', NULL) IS NULL;
+----
+true
+
+query I
+SELECT cron_delete(NULL) IS NULL;
+----
+true
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+# Planning a query must not schedule anything: cron() is VOLATILE and never constant-folded.
+statement ok
+EXPLAIN SELECT cron('SELECT 1', '0 0 0 1 1 *');
+
+statement ok
+PREPARE p AS SELECT cron('SELECT 1', '0 0 0 1 1 *');
+
+query I
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+query I
+SELECT stability FROM duckdb_functions() WHERE function_name IN ('cron', 'cron_delete') ORDER BY function_name;
+----
+VOLATILE
+VOLATILE
+
+# Each call schedules exactly one job.
+query I
+SELECT count(DISTINCT cron('SELECT 1', '0 0 0 1 1 *')) FROM range(3);
+----
+3
+
+query I
+SELECT count(cron_delete(job_id)) FROM cron_jobs();
+----
+3

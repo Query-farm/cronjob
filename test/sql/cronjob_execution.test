@@ -1,0 +1,92 @@
+# name: test/sql/cronjob_execution.test
+# description: jobs actually run, record their results, and may call the cron functions themselves
+# group: [cronjob]
+
+require cronjob
+
+statement ok
+CREATE TABLE ticks (job VARCHAR, ts TIMESTAMPTZ DEFAULT now());
+
+# A job that succeeds every second.
+query I
+SELECT cron('INSERT INTO ticks (job) VALUES (''ok'')', '* * * * * *');
+----
+task_0
+
+# A job that fails every second.
+query I
+SELECT cron('INSERT INTO missing_table VALUES (1)', '* * * * * *');
+----
+task_1
+
+# A job that reads the job table while running: this used to deadlock the scheduler.
+query I
+SELECT cron('INSERT INTO ticks (job) SELECT ''self'' FROM cron_jobs() LIMIT 1', '* * * * * *');
+----
+task_2
+
+# A job that deletes itself after its first run.
+query I
+SELECT cron('SELECT cron_delete(''task_3'')', '* * * * * *');
+----
+task_3
+
+sleep 3 seconds
+
+query II
+SELECT job, count(*) >= 1 FROM ticks GROUP BY job ORDER BY job;
+----
+ok	true
+self	true
+
+query IIII
+SELECT job_id, status, last_result, run_count >= 1 AND error_count = 0 FROM cron_jobs() WHERE job_id IN ('task_0', 'task_2') ORDER BY job_id;
+----
+task_0	Active	Success	true
+task_2	Active	Success	true
+
+query III
+SELECT status, last_result LIKE 'Error: %missing_table%', error_count >= 1 AND error_count = run_count FROM cron_jobs() WHERE job_id = 'task_1';
+----
+Active	true	true
+
+query I
+SELECT count(*) FROM cron_jobs() WHERE job_id = 'task_3';
+----
+0
+
+query II
+SELECT bool_and(success), bool_and(result = 'Success') FROM cron_job_history() WHERE job_id = 'task_0';
+----
+true	true
+
+query II
+SELECT bool_or(success), bool_and(result LIKE 'Error: %') FROM cron_job_history() WHERE job_id = 'task_1';
+----
+false	true
+
+query I
+SELECT bool_and(finished_at >= started_at AND last_run IS NOT NULL) FROM cron_job_history() JOIN cron_jobs() USING (job_id);
+----
+true
+
+query I
+SELECT count(cron_delete(job_id)) FROM cron_jobs();
+----
+3
+
+query I
+SELECT count(*) FROM cron_job_history();
+----
+0
+
+# No job runs after deletion.
+statement ok
+CREATE TABLE snapshot AS SELECT count(*) AS n FROM ticks;
+
+sleep 2 seconds
+
+query I
+SELECT (SELECT count(*) FROM ticks) - n FROM snapshot;
+----
+0

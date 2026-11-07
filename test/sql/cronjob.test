@@ -1,29 +1,75 @@
 # name: test/sql/cronjob.test
-# description: test cronjob extension
+# description: schedule, list and delete cron jobs
 # group: [cronjob]
 
-# Before we load the extension, this will fail
 statement error
-SELECT cronjob('Sam');
+SELECT cron('SELECT 1', '* * * * * *');
 ----
-Catalog Error: Scalar Function with name cronjob does not exist!
+Catalog Error
 
-# Require statement will ensure this test is run with this extension loaded
 require cronjob
 
-# Confirm the extension works
 query I
-SELECT cron('SELECT version()', '*/10 * * * * *');
+SELECT count(*) FROM cron_jobs();
+----
+0
+
+# Jobs on a schedule that will not fire during the test (once a year).
+query I
+SELECT cron('SELECT version()', '0 0 0 1 1 *');
 ----
 task_0
 
-query II
-SELECT job_id, status FROM cron_jobs();
+query I
+SELECT cron('SELECT ''héllo 🦆''', '*/10 * * * * *');
 ----
-task_0	Active
+task_1
+
+query IIIII
+SELECT job_id, query, schedule, status, last_run IS NULL FROM cron_jobs() ORDER BY job_id;
+----
+task_0	SELECT version()	0 0 0 1 1 *	Active	true
+task_1	SELECT 'héllo 🦆'	*/10 * * * * *	Active	true
+
+query IIII
+SELECT typeof(next_run), next_run > now(), run_count, error_count FROM cron_jobs() ORDER BY job_id;
+----
+TIMESTAMP WITH TIME ZONE	true	0	0
+TIMESTAMP WITH TIME ZONE	true	0	0
+
+# A yearly job fires on January 1st at midnight UTC.
+query I
+SELECT strftime(make_timestamp(epoch_us(next_run)), '%m-%d %H:%M:%S') FROM cron_jobs() WHERE job_id = 'task_0';
+----
+01-01 00:00:00
+
+query I
+SELECT created_at <= now() FROM cron_jobs() WHERE job_id = 'task_0';
+----
+true
+
+query I
+SELECT count(*) FROM cron_job_history();
+----
+0
 
 query I
 SELECT cron_delete('task_0');
+----
+true
+
+statement error
+SELECT cron_delete('task_0');
+----
+Cron job 'task_0' does not exist
+
+statement error
+SELECT cron_delete('no such job');
+----
+Cron job 'no such job' does not exist
+
+query I
+SELECT cron_delete(job_id) FROM cron_jobs();
 ----
 true
 
@@ -31,3 +77,14 @@ query I
 SELECT count(*) FROM cron_jobs();
 ----
 0
+
+# Job ids are never reused.
+query I
+SELECT cron('SELECT 1', '0 0 0 1 1 *');
+----
+task_2
+
+query I
+SELECT cron_delete('task_2');
+----
+true
