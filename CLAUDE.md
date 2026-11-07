@@ -46,22 +46,26 @@ Tests use DuckDB's SQLLogicTest format located in `test/sql/`. To run a single t
 
 ### Extension Structure
 - `src/cronjob_extension.cpp` - Main extension implementation containing:
-  - `CronTask` - Struct representing a scheduled job with ID, query, schedule, and execution history
-  - `CronScheduler` - Singleton scheduler class that manages a background thread for job execution
-  - SQL functions: `cron()`, `cron_delete()`, `cron_jobs()` table function
+  - `CronTask` - Struct representing a scheduled job with ID, query, schedule, counters and execution history
+  - `CronScheduler` - One scheduler per database, stored in the database ObjectCache; owns a worker thread that
+    runs due jobs with the state mutex released and is stopped/joined when the database closes
+  - SQL functions: `cron()`, `cron_delete()` (both VOLATILE), `cron_jobs()` and `cron_job_history()` table functions
 
 ### Dependencies
 - `ccronexpr/` - C library for parsing cron expressions (vendored)
 - `duckdb/` - DuckDB source as git submodule
 - `extension-ci-tools/` - DuckDB extension build tools as git submodule
-- OpenSSL - Required for build (linked via CMake)
 
 ### Cron Expression Format
-The extension uses six-field cron expressions: `second minute hour day-of-month month day-of-week`
+The extension uses six-field cron expressions: `second minute hour day-of-month month day-of-week`, evaluated in UTC.
+Expressions that never match a real date (e.g. `0 0 0 30 2 *`) are rejected by `cron()`.
+
+### Version
+`CRONJOB_VERSION` in `CMakeLists.txt` is the single source for `Version()` and telemetry.
 
 ## Updating DuckDB Version
 
-See `docs/UPDATING.md` for the full process. Key steps:
+Key steps:
 1. Update `./duckdb` submodule to latest tagged release
 2. Update `./extension-ci-tools` to matching version branch
 3. Update `duckdb_version` in `.github/workflows/MainDistributionPipeline.yml`
